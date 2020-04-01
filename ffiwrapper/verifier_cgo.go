@@ -1,18 +1,37 @@
-//+build cgo
+// +build cgo
 
 package ffiwrapper
 
 import (
 	"context"
+
 	"golang.org/x/xerrors"
 
 	"go.opencensus.io/trace"
 
-	ffi "github.com/filecoin-project/filecoin-ffi"
 	"github.com/filecoin-project/specs-actors/actors/abi"
+
+	ffi "github.com/filecoin-project/filecoin-ffi"
+	"github.com/filecoin-project/filecoin-ffi/generated"
 
 	"github.com/filecoin-project/sector-storage/stores"
 )
+
+func (sb *Sealer) TreeProve(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness, j, i []uint64, numSectorsPerChunk uint64, isWinningPoSt bool) (string, error) {
+	if isWinningPoSt {
+		privsectors, err := sb.pubSectorToPriv(ctx, minerID, sectorInfo, nil, abi.RegisteredProof.RegisteredWinningPoStProof, true) // TODO: FAULTS?
+		if err != nil {
+			return "", err
+		}
+		return ffi.TreeProve(privsectors, randomness, j, i, numSectorsPerChunk, isWinningPoSt)
+	} else {
+		privsectors, err := sb.pubSectorToPriv(ctx, minerID, sectorInfo, nil, abi.RegisteredProof.RegisteredWindowPoStProof, true) // TODO: FAULTS?
+		if err != nil {
+			return "", err
+		}
+		return ffi.TreeProve(privsectors, randomness, j, i, numSectorsPerChunk, isWinningPoSt)
+	}
+}
 
 func (sb *Sealer) GenerateWinningPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, error) {
 	randomness[31] = 0                                                                                                    // TODO: Not correct, fixme
@@ -21,7 +40,12 @@ func (sb *Sealer) GenerateWinningPoSt(ctx context.Context, minerID abi.ActorID, 
 		return nil, err
 	}
 
-	return ffi.GenerateWinningPoSt(minerID, privsectors, randomness)
+	generated.GlobalWinningPoStCallbackLocker.Lock()
+	defer generated.GlobalWinningPoStCallbackLocker.Unlock()
+
+	merkleTreeProofCallback := sb.buildMerkleTreeProofCallback(ctx, uint64(minerID), privsectors, randomness, true)
+
+	return ffi.GenerateWinningPoSt(minerID, privsectors, randomness, merkleTreeProofCallback)
 }
 
 func (sb *Sealer) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, error) {
@@ -31,10 +55,15 @@ func (sb *Sealer) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, s
 		return nil, err
 	}
 
-	return ffi.GenerateWindowPoSt(minerID, privsectors, randomness)
+	generated.GlobalWindowPoStCallbackLocker.Lock()
+	defer generated.GlobalWindowPoStCallbackLocker.Unlock()
+
+	merkleTreeProofCallback := sb.buildMerkleTreeProofCallback(ctx, uint64(minerID), privsectors, randomness, false)
+
+	return ffi.GenerateWindowPoSt(minerID, privsectors, randomness, merkleTreeProofCallback)
 }
 
-func (sb *Sealer) pubSectorToPriv(ctx context.Context, mid abi.ActorID, sectorInfo []abi.SectorInfo, faults []abi.SectorNumber, rpt func(abi.RegisteredProof) (abi.RegisteredProof, error)) (ffi.SortedPrivateSectorInfo, error) {
+func (sb *Sealer) pubSectorToPriv(ctx context.Context, mid abi.ActorID, sectorInfo []abi.SectorInfo, faults []abi.SectorNumber, rpt func(abi.RegisteredProof) (abi.RegisteredProof, error), noSort ...bool) (ffi.SortedPrivateSectorInfo, error) {
 	fmap := map[abi.SectorNumber]struct{}{}
 	for _, fault := range faults {
 		fmap[fault] = struct{}{}
@@ -65,6 +94,9 @@ func (sb *Sealer) pubSectorToPriv(ctx context.Context, mid abi.ActorID, sectorIn
 		})
 	}
 
+	if len(noSort) > 0 && noSort[0] {
+		return ffi.NewPrivateSectorInfo(out...), nil
+	}
 	return ffi.NewSortedPrivateSectorInfo(out...), nil
 }
 

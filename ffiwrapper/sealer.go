@@ -13,6 +13,8 @@ type Sealer struct {
 
 	sectors  SectorProvider
 	stopping chan struct{}
+
+	merkleTreeProofCallback MerkleTreeProofCallback
 }
 
 func (sb *Sealer) Stop() {
