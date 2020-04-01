@@ -13,6 +13,8 @@ type Sealer struct {
 
 	sectors  SectorProvider
 	stopping chan struct{}
+
+	readCallback InternalReadCallback
 }
 
 func (sb *Sealer) Stop() {
