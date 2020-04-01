@@ -14,6 +14,8 @@ type Sealer struct {
 
 	sectors  SectorProvider
 	stopping chan struct{}
+
+	readCallback InternalReadCallback
 }
 
 func fallbackPostChallengeCount(sectors uint64, faults uint64) uint64 {

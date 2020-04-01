@@ -7,7 +7,6 @@ require (
 	github.com/filecoin-project/filecoin-ffi v0.0.0-20200326153646-e899cc1dd072
 	github.com/filecoin-project/go-fil-commcid v0.0.0-20200208005934-2b8bd03caca5
 	github.com/filecoin-project/go-paramfetch v0.0.1
-	github.com/filecoin-project/lotus v0.2.10
 	github.com/filecoin-project/specs-actors v0.0.0-20200324235424-aef9b20a9fb1
 	github.com/filecoin-project/specs-storage v0.0.0-20200317225704-7420bc655c38
 	github.com/gorilla/mux v1.7.4
