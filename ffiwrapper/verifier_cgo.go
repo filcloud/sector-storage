@@ -1,18 +1,45 @@
-//+build cgo
+// +build cgo
 
 package ffiwrapper
 
 import (
 	"context"
+
 	"golang.org/x/xerrors"
 
 	"go.opencensus.io/trace"
 
-	ffi "github.com/filecoin-project/filecoin-ffi"
 	"github.com/filecoin-project/specs-actors/actors/abi"
+
+	ffi "github.com/filecoin-project/filecoin-ffi"
+	"github.com/filecoin-project/filecoin-ffi/generated"
 
 	"github.com/filecoin-project/sector-storage/stores"
 )
+
+func (sb *Sealer) TreeProve(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness, j, i []uint64, numSectorsPerChunk uint64, isWinningPoSt bool) (string, error) {
+	if isWinningPoSt {
+		privsectors, skipped, done, err := sb.pubSectorToPriv(ctx, minerID, sectorInfo, nil, abi.RegisteredSealProof.RegisteredWinningPoStProof, true) // TODO: FAULTS?
+		if err != nil {
+			return "", err
+		}
+		defer done()
+		if len(skipped) > 0 {
+			return "", xerrors.Errorf("pubSectorToPriv skipped sectors: %+v", skipped)
+		}
+		return ffi.TreeProve(privsectors, randomness, j, i, numSectorsPerChunk, isWinningPoSt)
+	} else {
+		privsectors, skipped, done, err := sb.pubSectorToPriv(ctx, minerID, sectorInfo, nil, abi.RegisteredSealProof.RegisteredWindowPoStProof, true) // TODO: FAULTS?
+		if err != nil {
+			return "", err
+		}
+		defer done()
+		if len(skipped) > 0 {
+			return "", xerrors.Errorf("pubSectorToPriv skipped sectors: %+v", skipped)
+		}
+		return ffi.TreeProve(privsectors, randomness, j, i, numSectorsPerChunk, isWinningPoSt)
+	}
+}
 
 func (sb *Sealer) GenerateWinningPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, error) {
 	randomness[31] &= 0x3f
@@ -25,7 +52,19 @@ func (sb *Sealer) GenerateWinningPoSt(ctx context.Context, minerID abi.ActorID, 
 		return nil, xerrors.Errorf("pubSectorToPriv skipped sectors: %+v", skipped)
 	}
 
-	return ffi.GenerateWinningPoSt(minerID, privsectors, randomness)
+	generated.GlobalWinningPoStCallbackLocker.Lock()
+	defer generated.GlobalWinningPoStCallbackLocker.Unlock()
+
+	if sb.postCallback == nil { // local
+		return sb.generatePoSt(minerID, privsectors, randomness, "", true)
+	}
+
+	privsectors, proofsStr, err := sb.postCallback(ctx, privsectors, string(randomness), true)
+	if err != nil {
+		return nil, err
+	}
+
+	return sb.generatePoSt(minerID, privsectors, randomness, proofsStr, true)
 }
 
 func (sb *Sealer) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, []abi.SectorID, error) {
@@ -36,11 +75,34 @@ func (sb *Sealer) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, s
 	}
 	defer done()
 
-	proof, err := ffi.GenerateWindowPoSt(minerID, privsectors, randomness)
+	generated.GlobalWindowPoStCallbackLocker.Lock()
+	defer generated.GlobalWindowPoStCallbackLocker.Unlock()
+
+	if sb.postCallback == nil { // local
+		proof, err := sb.generatePoSt(minerID, privsectors, randomness, "", false)
+		return proof, skipped, err
+	}
+
+	remainingPrivsectors, proofsStr, err := sb.postCallback(ctx, privsectors, string(randomness), false)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rpm := make(map[abi.SectorNumber]struct{})
+	for _, s := range remainingPrivsectors.Values() {
+		rpm[s.SectorNumber] = struct{}{}
+	}
+	for _, s := range privsectors.Values() {
+		if _, ok := rpm[s.SectorNumber]; !ok {
+			skipped = append(skipped, abi.SectorID{Miner: minerID, Number: s.SectorNumber})
+		}
+	}
+
+	proof, err := sb.generatePoSt(minerID, remainingPrivsectors, randomness, proofsStr, false)
 	return proof, skipped, err
 }
 
-func (sb *Sealer) pubSectorToPriv(ctx context.Context, mid abi.ActorID, sectorInfo []abi.SectorInfo, faults []abi.SectorNumber, rpt func(abi.RegisteredSealProof) (abi.RegisteredPoStProof, error)) (ffi.SortedPrivateSectorInfo, []abi.SectorID, func(), error) {
+func (sb *Sealer) pubSectorToPriv(ctx context.Context, mid abi.ActorID, sectorInfo []abi.SectorInfo, faults []abi.SectorNumber, rpt func(abi.RegisteredSealProof) (abi.RegisteredPoStProof, error), noSort ...bool) (ffi.SortedPrivateSectorInfo, []abi.SectorID, func(), error) {
 	fmap := map[abi.SectorNumber]struct{}{}
 	for _, fault := range faults {
 		fmap[fault] = struct{}{}
@@ -84,6 +146,9 @@ func (sb *Sealer) pubSectorToPriv(ctx context.Context, mid abi.ActorID, sectorIn
 		})
 	}
 
+	if len(noSort) > 0 && noSort[0] {
+		return ffi.NewPrivateSectorInfo(out...), skipped, done, nil
+	}
 	return ffi.NewSortedPrivateSectorInfo(out...), skipped, done, nil
 }
 

@@ -3,6 +3,8 @@ package ffiwrapper
 import (
 	"github.com/filecoin-project/specs-actors/actors/abi"
 	logging "github.com/ipfs/go-log/v2"
+
+	ffi "github.com/filecoin-project/filecoin-ffi"
 )
 
 var log = logging.Logger("ffiwrapper")
@@ -13,6 +15,9 @@ type Sealer struct {
 
 	sectors  SectorProvider
 	stopping chan struct{}
+
+	postCallback PoStCallback
+	generatePoSt func (abi.ActorID, ffi.SortedPrivateSectorInfo, abi.PoStRandomness, string, bool) ([]abi.PoStProof, error)
 }
 
 func (sb *Sealer) Stop() {

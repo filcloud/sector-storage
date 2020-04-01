@@ -31,4 +31,4 @@ require (
 	honnef.co/go/tools v0.0.1-2020.1.3 // indirect
 )
 
-replace github.com/filecoin-project/filecoin-ffi => ./extern/filecoin-ffi
+replace github.com/filecoin-project/filecoin-ffi => ../lotus/extern/filecoin-ffi
