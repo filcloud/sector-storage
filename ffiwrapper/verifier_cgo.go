@@ -4,16 +4,53 @@ package ffiwrapper
 
 import (
 	"context"
+	"math"
+
 	"golang.org/x/xerrors"
 
 	"go.opencensus.io/trace"
 
 	ffi "github.com/filecoin-project/filecoin-ffi"
+	"github.com/filecoin-project/filecoin-ffi/generated"
 	"github.com/filecoin-project/specs-actors/actors/abi"
 	"github.com/filecoin-project/specs-storage/storage"
 
 	"github.com/filecoin-project/sector-storage/stores"
 )
+
+type ReadCallback func(ctx context.Context, miner uint64, sectorID uint64, cacheID string, offset uint64, size uint64, buf []byte) uint64
+
+type InternalReadCallback func(ctx context.Context, info ffi.PrivateSectorInfo, miner uint64, sectorID uint64, cacheID string, offset uint64, size uint64, buf []byte) uint64
+
+var DefaultReadCallback InternalReadCallback
+
+func (sb *Sealer) SetNetReadCallback(cb ReadCallback, tryLocal bool) {
+	sb.readCallback = func(ctx context.Context, info ffi.PrivateSectorInfo, miner uint64, sectorID uint64, cacheID string, offset uint64, size uint64, buf []byte) uint64 {
+		if tryLocal {
+			n := DefaultReadCallback(ctx, info, miner, sectorID, cacheID, offset, size, buf)
+			if n != math.MaxUint64 {
+				return n
+			}
+		}
+		return cb(ctx, miner, sectorID, cacheID, offset, size, buf)
+	}
+}
+
+func (sb *Sealer) buildNetReadCallback(ctx context.Context, info ffi.SortedPrivateSectorInfo, miner uint64) ffi.NetReadCallback {
+	sectors := make(map[uint64]ffi.PrivateSectorInfo)
+	for _, f := range info.Values() {
+		sectors[uint64(f.SectorNumber)] = f
+	}
+
+	// TODO: local cache according to same sectorID/cacheID/offset/size
+	return func(sectorID uint64, cacheID string, offset uint64, size uint64, buf []byte) uint64 {
+		f, ok := sectors[sectorID]
+		if !ok {
+			panic("sector not found") // should never go here
+		}
+		return sb.readCallback(ctx, f, miner, sectorID, cacheID, offset, size, buf)
+	}
+}
 
 func (sb *Sealer) ComputeElectionPoSt(ctx context.Context, miner abi.ActorID, sectorInfo []abi.SectorInfo, challengeSeed abi.PoStRandomness, winners []abi.PoStCandidate) ([]abi.PoStProof, error) {
 	challengeSeed[31] = 0
@@ -23,7 +60,10 @@ func (sb *Sealer) ComputeElectionPoSt(ctx context.Context, miner abi.ActorID, se
 		return nil, err
 	}
 
-	return ffi.GeneratePoSt(miner, privsects, challengeSeed, winners)
+	generated.NetReadCallbackLocker.Lock()
+	defer generated.NetReadCallbackLocker.Unlock()
+
+	return ffi.GeneratePoSt(miner, privsects, challengeSeed, winners, sb.buildNetReadCallback(ctx, privsects, uint64(miner)))
 }
 
 func (sb *Sealer) GenerateFallbackPoSt(ctx context.Context, miner abi.ActorID, sectorInfo []abi.SectorInfo, challengeSeed abi.PoStRandomness, faults []abi.SectorNumber) (storage.FallbackPostOut, error) {
@@ -35,7 +75,11 @@ func (sb *Sealer) GenerateFallbackPoSt(ctx context.Context, miner abi.ActorID, s
 	challengeCount := fallbackPostChallengeCount(uint64(len(sectorInfo)), uint64(len(faults)))
 	challengeSeed[31] = 0
 
-	candidates, err := ffi.GenerateCandidates(miner, challengeSeed, challengeCount, privsectors)
+	generated.NetReadCallbackLocker.Lock()
+	defer generated.NetReadCallbackLocker.Unlock()
+	netReadCallback := sb.buildNetReadCallback(ctx, privsectors, uint64(miner))
+
+	candidates, err := ffi.GenerateCandidates(miner, challengeSeed, challengeCount, privsectors, netReadCallback)
 	if err != nil {
 		return storage.FallbackPostOut{}, err
 	}
@@ -45,7 +89,7 @@ func (sb *Sealer) GenerateFallbackPoSt(ctx context.Context, miner abi.ActorID, s
 		winners[idx] = candidates[idx].Candidate
 	}
 
-	proof, err := ffi.GeneratePoSt(miner, privsectors, challengeSeed, winners)
+	proof, err := ffi.GeneratePoSt(miner, privsectors, challengeSeed, winners, netReadCallback)
 	return storage.FallbackPostOut{
 		PoStInputs: ffiToStorageCandidates(candidates),
 		Proof:      proof,
@@ -60,8 +104,11 @@ func (sb *Sealer) GenerateEPostCandidates(ctx context.Context, miner abi.ActorID
 
 	challengeSeed[31] = 0
 
+	generated.NetReadCallbackLocker.Lock()
+	defer generated.NetReadCallbackLocker.Unlock()
+
 	challengeCount := ElectionPostChallengeCount(uint64(len(sectorInfo)), uint64(len(faults)))
-	pc, err := ffi.GenerateCandidates(miner, challengeSeed, challengeCount, privsectors)
+	pc, err := ffi.GenerateCandidates(miner, challengeSeed, challengeCount, privsectors, sb.buildNetReadCallback(ctx, privsectors, uint64(miner)))
 	if err != nil {
 		return nil, err
 	}

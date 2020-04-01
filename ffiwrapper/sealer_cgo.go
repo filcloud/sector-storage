@@ -35,6 +35,8 @@ func New(sectors SectorProvider, cfg *Config) (*Sealer, error) {
 		sectors: sectors,
 
 		stopping: make(chan struct{}),
+
+		readCallback: DefaultReadCallback,
 	}
 
 	return sb, nil
