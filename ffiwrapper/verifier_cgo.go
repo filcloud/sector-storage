@@ -4,15 +4,130 @@ package ffiwrapper
 
 import (
 	"context"
+	"fmt"
+	"math"
+	"os"
+	"strings"
+	"sync"
+
 	"golang.org/x/xerrors"
 
 	"go.opencensus.io/trace"
 
-	ffi "github.com/filecoin-project/filecoin-ffi"
 	"github.com/filecoin-project/specs-actors/actors/abi"
+
+	ffi "github.com/filecoin-project/filecoin-ffi"
+	"github.com/filecoin-project/filecoin-ffi/generated"
 
 	"github.com/filecoin-project/sector-storage/stores"
 )
+
+type ReadCallback func(ctx context.Context, miner uint64, sectorID uint64, cacheID string, offset uint64, size uint64, buf []byte) uint64
+
+type InternalReadCallback func(ctx context.Context, info ffi.PrivateSectorInfo, miner uint64, sectorID uint64, cacheID string, offset uint64, size uint64, buf []byte) uint64
+
+var DefaultReadCallback InternalReadCallback
+
+func (sb *Sealer) SetNetReadCallback(cb ReadCallback, tryLocal bool) {
+	sb.readCallback = func(ctx context.Context, info ffi.PrivateSectorInfo, miner uint64, sectorID uint64, cacheID string, offset uint64, size uint64, buf []byte) uint64 {
+		if tryLocal {
+			n := DefaultReadCallback(ctx, info, miner, sectorID, cacheID, offset, size, buf)
+			if n != math.MaxUint64 {
+				return n
+			}
+		}
+		return cb(ctx, miner, sectorID, cacheID, offset, size, buf)
+	}
+}
+
+type NetReadStat struct {
+	Name               string
+	Times              uint64
+	OffsetKinds        uint64
+	Bytes              uint64
+	sync.Mutex
+}
+
+type NetReadStatAndCache struct {
+	NetReadStat
+	cacheByOffsetKinds map[string][]byte
+}
+
+type NetReadStatAndCaches map[string]*NetReadStatAndCache
+
+func (s NetReadStatAndCaches) String() string {
+	sb := strings.Builder{}
+	for _, v := range s {
+		sb.WriteString(fmt.Sprintf(" %+v", v.NetReadStat))
+	}
+	return sb.String()
+}
+
+func ifStats() bool {
+	s := strings.ToLower(os.Getenv("LOTUS_NET_READ_STATS"))
+	return s == "true" || s == "1"
+}
+
+func (sb *Sealer) buildNetReadCallback(ctx context.Context, info ffi.SortedPrivateSectorInfo, miner uint64) (ffi.NetReadCallback, NetReadStatAndCaches) {
+	sectors := make(map[uint64]ffi.PrivateSectorInfo)
+	for _, f := range info.Values() {
+		sectors[uint64(f.SectorNumber)] = f
+	}
+
+	var m sync.Mutex
+	cache := make(map[string]*NetReadStatAndCache)
+
+	return func(sectorID uint64, cacheID string, offset uint64, size uint64, buf []byte) (n uint64) {
+		m.Lock()
+
+		f, ok := sectors[sectorID]
+		if !ok {
+			panic("sector not found") // should never go here
+		}
+
+		k := fmt.Sprintf("%d-%s", sectorID, cacheID)
+		s, ok := cache[k]
+		if !ok {
+			s = &NetReadStatAndCache{
+				NetReadStat: NetReadStat{
+					Name: k,
+				},
+				cacheByOffsetKinds: make(map[string][]byte),
+			}
+			cache[k] = s
+		}
+		s.Times++
+
+		m.Unlock()
+
+		s.Lock()
+		kk := fmt.Sprintf("%d-%d", offset, size)
+		b, ok := s.cacheByOffsetKinds[kk]
+		s.Unlock()
+
+		if !ok { // read and cache it
+			n = sb.readCallback(ctx, f, miner, sectorID, cacheID, offset, size, buf)
+			if n != math.MaxUint64 {
+				b = make([]byte, n)
+				copy(b, buf[:n])
+
+				s.Lock()
+				s.cacheByOffsetKinds[kk] = b
+				s.OffsetKinds = uint64(len(s.cacheByOffsetKinds))
+				s.Unlock()
+			}
+		} else { // cache exists
+			n = uint64(len(b))
+			copy(buf[:n], b)
+		}
+
+		s.Lock()
+		s.Bytes += n
+		s.Unlock()
+
+		return n
+	}, cache
+}
 
 func (sb *Sealer) GenerateWinningPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, error) {
 	randomness[31] = 0                                                                                                    // TODO: Not correct, fixme
@@ -21,7 +136,17 @@ func (sb *Sealer) GenerateWinningPoSt(ctx context.Context, minerID abi.ActorID, 
 		return nil, err
 	}
 
-	return ffi.GenerateWinningPoSt(minerID, privsectors, randomness)
+	generated.NetReadCallbackLocker.Lock()
+	defer generated.NetReadCallbackLocker.Unlock()
+
+	cb, cache := sb.buildNetReadCallback(ctx, privsectors, uint64(minerID))
+	defer func() {
+		if ifStats() {
+			log.Infof("GenerateWinningPoSt read stats: %s", NetReadStatAndCaches(cache).String())
+		}
+	}()
+
+	return ffi.GenerateWinningPoSt(minerID, privsectors, randomness, cb)
 }
 
 func (sb *Sealer) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, error) {
@@ -31,7 +156,17 @@ func (sb *Sealer) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, s
 		return nil, err
 	}
 
-	return ffi.GenerateWindowPoSt(minerID, privsectors, randomness)
+	generated.NetReadCallbackLocker.Lock()
+	defer generated.NetReadCallbackLocker.Unlock()
+
+	cb, cache := sb.buildNetReadCallback(ctx, privsectors, uint64(minerID))
+	defer func() {
+		if ifStats() {
+			log.Infof("GenerateWindowPoSt read stats: %s", NetReadStatAndCaches(cache).String())
+		}
+	}()
+
+	return ffi.GenerateWindowPoSt(minerID, privsectors, randomness, cb)
 }
 
 func (sb *Sealer) pubSectorToPriv(ctx context.Context, mid abi.ActorID, sectorInfo []abi.SectorInfo, faults []abi.SectorNumber, rpt func(abi.RegisteredProof) (abi.RegisteredProof, error)) (ffi.SortedPrivateSectorInfo, error) {
