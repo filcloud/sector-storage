@@ -4,9 +4,11 @@ package ffiwrapper
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math/bits"
 	"os"
+	"path/filepath"
 
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
@@ -192,7 +194,30 @@ func (sb *Sealer) ReadPieceFromSealedSector(ctx context.Context, sector abi.Sect
 	}, nil
 }
 
-func (sb *Sealer) SealPreCommit1(ctx context.Context, sector abi.SectorID, ticket abi.SealRandomness, pieces []abi.PieceInfo) (out storage.PreCommit1Out, err error) {
+func (sb *Sealer) GenerateCommDTree(ctx context.Context, unsealedPath, cachePath string, pieces []abi.PieceInfo) (out storage.PreCommit1Out, err error) {
+	var sum abi.UnpaddedPieceSize
+	for _, piece := range pieces {
+		sum += piece.Size.Unpadded()
+	}
+	ussize := abi.PaddedPieceSize(sb.ssize).Unpadded()
+	if sum != ussize {
+		return nil, xerrors.Errorf("aggregated piece sizes don't match sector size: %d != %d (%d)", sum, ussize, int64(ussize-sum))
+	}
+
+	// TODO: context cancellation respect
+	p1o, err := ffi.GenerateCommDTree(
+		sb.sealProofType,
+		cachePath,
+		unsealedPath,
+		pieces,
+	)
+	if err != nil {
+		return nil, xerrors.Errorf("generating comm_d tree for sector (%s): %w", unsealedPath, err)
+	}
+	return p1o, nil
+}
+
+func (sb *Sealer) SealPreCommit1WithCommD(ctx context.Context, sector abi.SectorID, ticket abi.SealRandomness, pieces []abi.PieceInfo, phase1Out storage.PreCommit1Out, ensureCommDSymLink func(string) error) (out storage.PreCommit1Out, err error) {
 	paths, done, err := sb.sectors.AcquireSector(ctx, sector, stores.FTUnsealed, stores.FTSealed|stores.FTCache, true)
 	if err != nil {
 		return nil, xerrors.Errorf("acquiring sector paths: %w", err)
@@ -233,20 +258,45 @@ func (sb *Sealer) SealPreCommit1(ctx context.Context, sector abi.SectorID, ticke
 	}
 
 	// TODO: context cancellation respect
-	p1o, err := ffi.SealPreCommitPhase1(
-		sb.sealProofType,
-		paths.Cache,
-		paths.Unsealed,
-		paths.Sealed,
-		sector.Number,
-		sector.Miner,
-		ticket,
-		pieces,
-	)
+	var p1o []byte
+	if len(phase1Out) == 0 {
+		p1o, err = ffi.SealPreCommitPhase1(
+			sb.sealProofType,
+			paths.Cache,
+			paths.Unsealed,
+			paths.Sealed,
+			sector.Number,
+			sector.Miner,
+			ticket,
+			pieces,
+		)
+	} else {
+		DEFAULT_STORE_CONFIG_DATA_VERSION := 2 // TODO
+		commDTreePath := fmt.Sprintf("sc-0%d-data-tree-d.dat", DEFAULT_STORE_CONFIG_DATA_VERSION)
+		if err = ensureCommDSymLink(filepath.Join(paths.Cache, commDTreePath)); err != nil {
+			return nil, xerrors.Errorf("ensure comm_d tree link: %w", err)
+		}
+
+		p1o, err = ffi.SealPreCommitPhase1WithCommD(
+			sb.sealProofType,
+			paths.Cache,
+			paths.Unsealed,
+			paths.Sealed,
+			sector.Number,
+			sector.Miner,
+			ticket,
+			pieces,
+			phase1Out,
+		)
+	}
 	if err != nil {
 		return nil, xerrors.Errorf("presealing sector %d (%s): %w", sector.Number, paths.Unsealed, err)
 	}
 	return p1o, nil
+}
+
+func (sb *Sealer) SealPreCommit1(ctx context.Context, sector abi.SectorID, ticket abi.SealRandomness, pieces []abi.PieceInfo) (out storage.PreCommit1Out, err error) {
+	return sb.SealPreCommit1WithCommD(ctx, sector, ticket, pieces, nil, nil)
 }
 
 func (sb *Sealer) SealPreCommit2(ctx context.Context, sector abi.SectorID, phase1Out storage.PreCommit1Out) (storage.SectorCids, error) {
