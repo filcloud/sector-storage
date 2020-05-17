@@ -15,6 +15,7 @@ type Sealer struct {
 	stopping chan struct{}
 
 	readCallback InternalReadCallback
+	merkleTreeProofCallback MerkleTreeProofCallback
 }
 
 func (sb *Sealer) Stop() {

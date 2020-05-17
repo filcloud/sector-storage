@@ -1,4 +1,4 @@
-//+build cgo
+// +build cgo
 
 package ffiwrapper
 
@@ -26,6 +26,8 @@ type ReadCallback func(ctx context.Context, miner uint64, sectorID uint64, cache
 
 type InternalReadCallback func(ctx context.Context, info ffi.PrivateSectorInfo, miner uint64, sectorID uint64, cacheID string, offset uint64, size uint64, buf []byte) uint64
 
+type MerkleTreeProofCallback func(ctx context.Context, miner uint64, info abi.SectorInfo, sectorId uint64, j uint64, i uint64, numSectorsPerChunk uint64, randomness string, isWinningPoSt bool) string
+
 var DefaultReadCallback InternalReadCallback
 
 func (sb *Sealer) SetNetReadCallback(cb ReadCallback, tryLocal bool) {
@@ -41,10 +43,10 @@ func (sb *Sealer) SetNetReadCallback(cb ReadCallback, tryLocal bool) {
 }
 
 type NetReadStat struct {
-	Name               string
-	Times              uint64
-	OffsetKinds        uint64
-	Bytes              uint64
+	Name        string
+	Times       uint64
+	OffsetKinds uint64
+	Bytes       uint64
 }
 
 type NetReadStatAndCache struct {
@@ -129,6 +131,70 @@ func (sb *Sealer) buildNetReadCallback(ctx context.Context, info ffi.SortedPriva
 	}, cache
 }
 
+func (sb *Sealer) SetMerkleTreeProofCallback(cb MerkleTreeProofCallback) {
+	sb.merkleTreeProofCallback = cb
+}
+
+func (sb *Sealer) buildMerkleTreeProofCallback(ctx context.Context, info ffi.SortedPrivateSectorInfo, miner uint64, randomness abi.PoStRandomness, isWinningPoSt bool) (ffi.MerkleTreeProofCallback, map[uint64]int) {
+	sectors := make(map[uint64]ffi.PrivateSectorInfo)
+	for _, f := range info.Values() {
+		sectors[uint64(f.SectorNumber)] = f
+	}
+
+	var m sync.Mutex
+	stats := make(map[uint64]int)
+
+	return func(sectorId uint64, j uint64, i uint64, numSectorsPerChunk uint64, r string, proof []byte, proofLen uint64) uint64 {
+		m.Lock()
+
+		f, ok := sectors[sectorId]
+		if !ok {
+			panic("sector not found") // should never go here
+		}
+
+		stats[sectorId]++
+
+		m.Unlock()
+
+		var result []byte
+
+		if sb.merkleTreeProofCallback == nil { // local
+			resultStr, err := sb.TreeProve(ctx, abi.ActorID(miner), f.SectorInfo, randomness, j, i, numSectorsPerChunk, isWinningPoSt)
+			if err != nil {
+				log.Errorf("Build merkle tree proof: %s", err)
+				return 0 // indicate error
+			}
+			result = []byte(resultStr)
+		} else {
+			result = []byte(sb.merkleTreeProofCallback(ctx, miner, f.SectorInfo, sectorId, j, i, numSectorsPerChunk, string(randomness), isWinningPoSt))
+		}
+
+		resultLen := uint64(len(result))
+		if resultLen > proofLen {
+			log.Errorf("Build merkle tree proof: buffer is too small, needs length %d", resultLen)
+			return 0 // indicate error
+		}
+		copy(proof[:resultLen], result)
+		return resultLen
+	}, stats
+}
+
+func (sb *Sealer) TreeProve(ctx context.Context, minerID abi.ActorID, sectorInfo abi.SectorInfo, randomness abi.PoStRandomness, j, i, numSectorsPerChunk uint64, isWinningPoSt bool) (string, error) {
+	if isWinningPoSt {
+		privsectors, err := sb.pubSectorToPriv(ctx, minerID, []abi.SectorInfo{sectorInfo}, nil, abi.RegisteredProof.RegisteredWinningPoStProof) // TODO: FAULTS?
+		if err != nil {
+			return "", err
+		}
+		return ffi.TreeProve(privsectors, randomness, j, i, numSectorsPerChunk, isWinningPoSt)
+	} else {
+		privsectors, err := sb.pubSectorToPriv(ctx, minerID, []abi.SectorInfo{sectorInfo}, nil, abi.RegisteredProof.RegisteredWindowPoStProof) // TODO: FAULTS?
+		if err != nil {
+			return "", err
+		}
+		return ffi.TreeProve(privsectors, randomness, j, i, numSectorsPerChunk, isWinningPoSt)
+	}
+}
+
 func (sb *Sealer) GenerateWinningPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, error) {
 	randomness[31] = 0                                                                                                    // TODO: Not correct, fixme
 	privsectors, err := sb.pubSectorToPriv(ctx, minerID, sectorInfo, nil, abi.RegisteredProof.RegisteredWinningPoStProof) // TODO: FAULTS?
@@ -136,17 +202,21 @@ func (sb *Sealer) GenerateWinningPoSt(ctx context.Context, minerID abi.ActorID, 
 		return nil, err
 	}
 
-	generated.NetReadCallbackLocker.Lock()
-	defer generated.NetReadCallbackLocker.Unlock()
+	generated.GlobalCallbackLocker.Lock()
+	defer generated.GlobalCallbackLocker.Unlock()
 
 	cb, cache := sb.buildNetReadCallback(ctx, privsectors, uint64(minerID))
+
+	merkleTreeProofCallback, stats := sb.buildMerkleTreeProofCallback(ctx, privsectors, uint64(minerID), randomness, true)
+
 	defer func() {
 		if ifStats() {
-			log.Infof("GenerateWinningPoSt read stats: %s", NetReadStatAndCaches(cache).String())
+			log.Infof("GenerateWinningPoSt net read stats: %s", NetReadStatAndCaches(cache).String())
+			log.Infof("GenerateWinningPoSt net merkle tree proof stats: %+v", stats)
 		}
 	}()
 
-	return ffi.GenerateWinningPoSt(minerID, privsectors, randomness, cb)
+	return ffi.GenerateWinningPoSt(minerID, privsectors, randomness, cb, merkleTreeProofCallback)
 }
 
 func (sb *Sealer) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, error) {
@@ -156,17 +226,21 @@ func (sb *Sealer) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, s
 		return nil, err
 	}
 
-	generated.NetReadCallbackLocker.Lock()
-	defer generated.NetReadCallbackLocker.Unlock()
+	generated.GlobalCallbackLocker.Lock()
+	defer generated.GlobalCallbackLocker.Unlock()
 
 	cb, cache := sb.buildNetReadCallback(ctx, privsectors, uint64(minerID))
+
+	merkleTreeProofCallback, stats := sb.buildMerkleTreeProofCallback(ctx, privsectors, uint64(minerID), randomness, false)
+
 	defer func() {
 		if ifStats() {
 			log.Infof("GenerateWindowPoSt read stats: %s", NetReadStatAndCaches(cache).String())
+			log.Infof("GenerateWindowPoSt net merkle tree proof stats: %+v", stats)
 		}
 	}()
 
-	return ffi.GenerateWindowPoSt(minerID, privsectors, randomness, cb)
+	return ffi.GenerateWindowPoSt(minerID, privsectors, randomness, cb, merkleTreeProofCallback)
 }
 
 func (sb *Sealer) pubSectorToPriv(ctx context.Context, mid abi.ActorID, sectorInfo []abi.SectorInfo, faults []abi.SectorNumber, rpt func(abi.RegisteredProof) (abi.RegisteredProof, error)) (ffi.SortedPrivateSectorInfo, error) {
