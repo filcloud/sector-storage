@@ -13,8 +13,9 @@ import (
 
 	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/sector-storage/fsutil"
 	"github.com/filecoin-project/specs-actors/actors/abi"
+
+	"github.com/filecoin-project/sector-storage/fsutil"
 )
 
 type StoragePath struct {
@@ -27,7 +28,7 @@ type StoragePath struct {
 	CanStore bool
 }
 
-// [path]/sectorstore.json
+// LocalStorageMeta [path]/sectorstore.json
 type LocalStorageMeta struct {
 	ID     ID
 	Weight uint64 // 0 = readonly
@@ -36,7 +37,7 @@ type LocalStorageMeta struct {
 	CanStore bool
 }
 
-// .lotusstorage/storage.json
+// StorageConfig .lotusstorage/storage.json
 type StorageConfig struct {
 	StoragePaths []LocalPath
 }
@@ -182,7 +183,7 @@ func (st *Local) OpenPath(ctx context.Context, p string) error {
 		ents, err := ioutil.ReadDir(filepath.Join(p, t.String()))
 		if err != nil {
 			if os.IsNotExist(err) {
-				if err := os.MkdirAll(filepath.Join(p, t.String()), 0755); err != nil {
+				if err := os.MkdirAll(filepath.Join(p, t.String()), 0755); err != nil { // nolint
 					return xerrors.Errorf("openPath mkdir '%s': %w", filepath.Join(p, t.String()), err)
 				}
 
@@ -334,7 +335,7 @@ func (st *Local) AcquireSector(ctx context.Context, sid abi.SectorID, spt abi.Re
 			continue
 		}
 
-		si, err := st.index.StorageFindSector(ctx, sid, fileType, false)
+		si, err := st.index.StorageFindSector(ctx, sid, fileType, spt, false)
 		if err != nil {
 			log.Warnf("finding existing sector %d(t:%d) failed: %+v", sid, fileType, err)
 			continue
@@ -441,7 +442,7 @@ func (st *Local) Remove(ctx context.Context, sid abi.SectorID, typ SectorFileTyp
 		return xerrors.New("delete expects one file type")
 	}
 
-	si, err := st.index.StorageFindSector(ctx, sid, typ, false)
+	si, err := st.index.StorageFindSector(ctx, sid, typ, 0, false)
 	if err != nil {
 		return xerrors.Errorf("finding existing sector %d(t:%d) failed: %w", sid, typ, err)
 	}
@@ -464,7 +465,7 @@ func (st *Local) RemoveCopies(ctx context.Context, sid abi.SectorID, typ SectorF
 		return xerrors.New("delete expects one file type")
 	}
 
-	si, err := st.index.StorageFindSector(ctx, sid, typ, false)
+	si, err := st.index.StorageFindSector(ctx, sid, typ, 0, false)
 	if err != nil {
 		return xerrors.Errorf("finding existing sector %d(t:%d) failed: %w", sid, typ, err)
 	}

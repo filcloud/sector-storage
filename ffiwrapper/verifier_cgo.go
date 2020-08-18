@@ -7,14 +7,15 @@ import (
 
 	"golang.org/x/xerrors"
 
-	"go.opencensus.io/trace"
-
 	"github.com/filecoin-project/specs-actors/actors/abi"
 
 	ffi "github.com/filecoin-project/filecoin-ffi"
-	"github.com/filecoin-project/filecoin-ffi/generated"
 
 	"github.com/filecoin-project/sector-storage/stores"
+
+	"go.opencensus.io/trace"
+
+	"github.com/filecoin-project/filecoin-ffi/generated"
 )
 
 func (sb *Sealer) TreeProve(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness, j, i []uint64, numSectorsPerChunk uint64, isWinningPoSt bool) (string, error) {

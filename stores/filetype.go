@@ -2,6 +2,7 @@ package stores
 
 import (
 	"fmt"
+
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/specs-actors/actors/abi"
@@ -89,7 +90,7 @@ func (t SectorFileType) All() [FileTypes]bool {
 }
 
 type SectorPaths struct {
-	Id abi.SectorID
+	ID abi.SectorID
 
 	Unsealed string
 	Sealed   string
